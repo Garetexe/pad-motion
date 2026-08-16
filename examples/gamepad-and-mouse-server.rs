@@ -4,7 +4,6 @@ use std::sync::Mutex;
 use std::time::{Instant, Duration};
 use std::thread;
 use std::fs;
-use std::collections::HashMap;
 
 use gilrs::{Gilrs, Button, Axis};
 use multiinput::{RawInputManager, RawEvent};
@@ -12,23 +11,41 @@ use multiinput::{RawInputManager, RawEvent};
 use pad_motion::protocol::*;
 use pad_motion::server::*;
 
+// --- Constantes de temporización ---
+// dt mínimo permitido para el cálculo de velocidad angular. Evita que un dt
+// casi-cero (jitter del scheduler / resolución del timer de Windows) dispare
+// el yaw/pitch a valores absurdos al dividir por un número minúsculo.
+const MIN_DT: f32 = 0.0005; // 0.5 ms
+// dt máximo permitido. Evita un salto brusco si el loop se pausó
+// (ventana sin foco, hitch del SO, etc).
+const MAX_DT: f32 = 0.05; // 50 ms
+// dt "de referencia" contra el que se calibró originalmente el parámetro
+// `smoothing` (pensado para un tick nominal de ~1ms). Se usa para hacer
+// el suavizado EMA independiente del framerate real.
+const REFERENCE_DT: f32 = 0.001;
+
 // Default Configuration
 struct AppConfig {
     sensitivity: f32,
-    invert_x: f32,      // 1.0 or -1.0
-    invert_y: f32,      // 1.0 or -1.0
+    invert_x: f32,      // 1.0 o -1.0
+    invert_y: f32,      // 1.0 o -1.0
     gravity_axis: u8,   // 0=X, 1=Y, 2=Z
-    gravity_amount: f32 // Usually 9.81
+    gravity_amount: f32, // Usually 9.81
+    smoothing: f32,      // 0.0 = sin suavizado, 0.98 = muy suave (interpretado como retención por REFERENCE_DT)
 }
 
 impl Default for AppConfig {
     fn default() -> Self {
         AppConfig {
-            sensitivity: 5.0,
-            invert_x: -1.0, // Flipped based on your feedback
-            invert_y: 1.0,  // Flipped based on your feedback
+            // Antes: 32.0. Más sensibilidad todavía.
+            sensitivity: 40.0,
+            invert_x: 1.0,  // Invertido respecto a la versión anterior (ejes estaban al revés)
+            invert_y: -1.0, // Invertido respecto a la versión anterior (ejes estaban al revés)
             gravity_axis: 1, // 1 = Y-Axis (Upright/Remote style) to fix "X" movement
             gravity_amount: 9.81,
+            // Subido de 0.85 a 0.9: casi el máximo de fluidez práctico (0.98 es el tope,
+            // pero ahí ya se siente con demasiado retardo). Ajustable en config.txt.
+            smoothing: 0.9,
         }
     }
 }
@@ -88,12 +105,17 @@ fn main() {
                               "invert_y" => new_config.invert_y = if val > 0.0 { 1.0 } else { -1.0 },
                               "gravity_axis" => new_config.gravity_axis = val as u8,
                               "gravity_amount" => new_config.gravity_amount = val,
+                              "smoothing" => new_config.smoothing = val.clamp(0.0, 0.98),
                               _ => {}
                           }
                       }
                   }
                   
                   // Update the shared config
+                  println!(
+                      "[config.txt recargado] sensibilidad={:.1}  suavizado={:.2}  invert_x={}  invert_y={}  gravity_axis={}",
+                      new_config.sensitivity, new_config.smoothing, new_config.invert_x, new_config.invert_y, new_config.gravity_axis
+                  );
                   if let Ok(mut c) = config.lock() {
                       *c = new_config;
                   }
@@ -107,6 +129,12 @@ fn main() {
   mouse_manager.register_devices(multiinput::DeviceType::Mice);
 
   let now = Instant::now();
+
+  // Estado persistente para el suavizado (EMA) y el cálculo de dt real
+  let mut smoothed_yaw: f32 = 0.0;
+  let mut smoothed_pitch: f32 = 0.0;
+  let mut last_tick = Instant::now();
+
   while running.load(Ordering::SeqCst) {
     // Consume controller events
     while let Some(_event) = gilrs.next_event() {
@@ -125,15 +153,38 @@ fn main() {
       }
     }
 
+    // Tiempo real transcurrido desde la última vuelta del loop.
+    // Se limita (clamp) a un rango razonable: esto es clave para eliminar
+    // el movimiento "a tropicones", ya que en Windows thread::sleep(1ms)
+    // no es preciso y dt puede oscilar erráticamente entre ~0.5ms y ~15ms+.
+    // Sin este clamp, un dt casi-cero dispara el yaw/pitch a valores enormes.
+    let dt_raw = last_tick.elapsed().as_secs_f32();
+    let dt = dt_raw.clamp(MIN_DT, MAX_DT);
+    last_tick = Instant::now();
+
     // Capture current config snapshot
-    let (sens, inv_x, inv_y, g_axis, g_val) = {
+    let (sens, inv_x, inv_y, g_axis, g_val, smooth) = {
         let c = config.lock().unwrap();
-        (c.sensitivity, c.invert_x, c.invert_y, c.gravity_axis, c.gravity_amount)
+        (c.sensitivity, c.invert_x, c.invert_y, c.gravity_axis, c.gravity_amount, c.smoothing)
     };
 
-    // Apply Sensitivity & Inversion
-    let gyro_yaw = delta_rotation_x * sens * inv_x;
-    let gyro_pitch = delta_rotation_y * sens * inv_y;
+    // Normaliza por dt (velocidad angular consistente sin importar
+    // si el loop tardó más o menos en esta vuelta)
+    let target_yaw   = (delta_rotation_x / dt) * sens * inv_x * 0.001;
+    let target_pitch = (delta_rotation_y / dt) * sens * inv_y * 0.001;
+
+    // Suavizado exponencial (EMA) independiente del framerate real.
+    // En vez de un factor fijo (1 - smoothing), se calcula la fracción de
+    // retención elevándola a (dt / REFERENCE_DT). Así, si el loop tarda más
+    // o menos que el tick nominal de referencia, la "fuerza" efectiva del
+    // suavizado se mantiene constante en el tiempo, en vez de fluctuar con
+    // el jitter del scheduler (causa principal del efecto "a tropicones").
+    let alpha = 1.0 - smooth.powf(dt / REFERENCE_DT);
+    smoothed_yaw   += (target_yaw   - smoothed_yaw)   * alpha;
+    smoothed_pitch += (target_pitch - smoothed_pitch) * alpha;
+
+    let gyro_yaw = smoothed_yaw;
+    let gyro_pitch = smoothed_pitch;
 
     // Apply Gravity Vector (Fixes the "X vs +" rotation issue)
     let (accel_x, accel_y, accel_z) = match g_axis {
