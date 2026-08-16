@@ -32,6 +32,9 @@ struct AppConfig {
     gravity_axis: u8,   // 0=X, 1=Y, 2=Z
     gravity_amount: f32, // Usually 9.81
     smoothing: f32,      // 0.0 = sin suavizado, 0.98 = muy suave (interpretado como retención por REFERENCE_DT)
+    deadzone: f32,       // Counts de mouse por debajo de este valor se ignoran (elimina jitter/deriva)
+    pitch_limit: f32,    // Tope blando de inclinación acumulada; evita el "flip" al pasar de vertical
+    pitch_recenter: f32, // Velocidad de recentrado automático del pitch (0 = desactivado)
 }
 
 impl Default for AppConfig {
@@ -46,6 +49,18 @@ impl Default for AppConfig {
             // Subido de 0.85 a 0.9: casi el máximo de fluidez práctico (0.98 es el tope,
             // pero ahí ya se siente con demasiado retardo). Ajustable en config.txt.
             smoothing: 0.9,
+            // Ignora movimientos de mouse menores a 2 counts por tick (ruido del sensor).
+            // Súbelo en config.txt (ej. deadzone=5) si notás deriva/temblor con el mouse quieto.
+            deadzone: 2.0,
+            // Tope "blando": cuando el pitch acumulado llega a este valor, se deja de
+            // seguir empujando en esa dirección. Está en las mismas unidades arbitrarias
+            // que gyroscope_pitch (no son grados reales), así que se calibra a ojo:
+            // si todavía llegás a voltear el control, bajalo (ej. pitch_limit=200).
+            pitch_limit: 300.0,
+            // Recentra el pitch acumulado hacia 0 automáticamente cuando no hay
+            // movimiento vertical nuevo. Esto es la "auto-calibración": evita que
+            // la deriva se vaya acercando al límite sin que te des cuenta.
+            pitch_recenter: 0.15,
         }
     }
 }
@@ -106,6 +121,9 @@ fn main() {
                               "gravity_axis" => new_config.gravity_axis = val as u8,
                               "gravity_amount" => new_config.gravity_amount = val,
                               "smoothing" => new_config.smoothing = val.clamp(0.0, 0.98),
+                              "deadzone" => new_config.deadzone = val.max(0.0),
+                              "pitch_limit" => new_config.pitch_limit = val.max(1.0),
+                              "pitch_recenter" => new_config.pitch_recenter = val.max(0.0),
                               _ => {}
                           }
                       }
@@ -113,8 +131,9 @@ fn main() {
                   
                   // Update the shared config
                   println!(
-                      "[config.txt recargado] sensibilidad={:.1}  suavizado={:.2}  invert_x={}  invert_y={}  gravity_axis={}",
-                      new_config.sensitivity, new_config.smoothing, new_config.invert_x, new_config.invert_y, new_config.gravity_axis
+                      "[config.txt recargado] sensibilidad={:.1}  suavizado={:.2}  invert_x={}  invert_y={}  gravity_axis={}  deadzone={:.1}  pitch_limit={:.0}  pitch_recenter={:.2}",
+                      new_config.sensitivity, new_config.smoothing, new_config.invert_x, new_config.invert_y, new_config.gravity_axis,
+                      new_config.deadzone, new_config.pitch_limit, new_config.pitch_recenter
                   );
                   if let Ok(mut c) = config.lock() {
                       *c = new_config;
@@ -133,6 +152,9 @@ fn main() {
   // Estado persistente para el suavizado (EMA) y el cálculo de dt real
   let mut smoothed_yaw: f32 = 0.0;
   let mut smoothed_pitch: f32 = 0.0;
+  // Estimación acumulada de "cuánto se inclinó" en el eje vertical, usada
+  // sólo para el tope blando y el auto-recentrado (ver más abajo).
+  let mut pitch_accum: f32 = 0.0;
   let mut last_tick = Instant::now();
 
   while running.load(Ordering::SeqCst) {
@@ -163,15 +185,39 @@ fn main() {
     last_tick = Instant::now();
 
     // Capture current config snapshot
-    let (sens, inv_x, inv_y, g_axis, g_val, smooth) = {
+    let (sens, inv_x, inv_y, g_axis, g_val, smooth, deadzone, pitch_limit, pitch_recenter) = {
         let c = config.lock().unwrap();
-        (c.sensitivity, c.invert_x, c.invert_y, c.gravity_axis, c.gravity_amount, c.smoothing)
+        (c.sensitivity, c.invert_x, c.invert_y, c.gravity_axis, c.gravity_amount, c.smoothing,
+         c.deadzone, c.pitch_limit, c.pitch_recenter)
     };
+
+    // --- Zona muerta: ignora micro-movimientos/ruido del mouse ---
+    if delta_rotation_x.abs() < deadzone { delta_rotation_x = 0.0; }
+    if delta_rotation_y.abs() < deadzone { delta_rotation_y = 0.0; }
 
     // Normaliza por dt (velocidad angular consistente sin importar
     // si el loop tardó más o menos en esta vuelta)
-    let target_yaw   = (delta_rotation_x / dt) * sens * inv_x * 0.001;
-    let target_pitch = (delta_rotation_y / dt) * sens * inv_y * 0.001;
+    let target_yaw       = (delta_rotation_x / dt) * sens * inv_x * 0.001;
+    let mut target_pitch = (delta_rotation_y / dt) * sens * inv_y * 0.001;
+
+    // --- Tope blando de pitch + auto-recentrado (evita el "flip") ---
+    // El juego que recibe estos datos integra gyroscope_pitch para saber cuánto
+    // te inclinaste. Si eso pasa de ~90°, empieza a leer pitch/yaw invertidos
+    // (el clásico flip de un puntero/Wiimote al pasar de la vertical). Para
+    // evitarlo llevamos una cuenta propia (pitch_accum) y:
+    //   1) si el movimiento actual seguiría empujando pitch_accum más allá del
+    //      límite, lo frenamos ahí (como si topara con algo, no rebota ni invierte),
+    //   2) cuando no estás moviendo el mouse verticalmente, pitch_accum se va
+    //      recentrando solo hacia 0 (auto-calibración: nunca se acumula deriva
+    //      sin que te des cuenta y te acerque al límite).
+    let projected_pitch = pitch_accum + target_pitch * dt;
+    if projected_pitch.abs() > pitch_limit && projected_pitch.signum() == target_pitch.signum() {
+        target_pitch = 0.0;
+    }
+    pitch_accum = (pitch_accum + target_pitch * dt).clamp(-pitch_limit, pitch_limit);
+    if pitch_recenter > 0.0 {
+        pitch_accum *= (1.0 - pitch_recenter * dt).max(0.0);
+    }
 
     // Suavizado exponencial (EMA) independiente del framerate real.
     // En vez de un factor fijo (1 - smoothing), se calcula la fracción de
