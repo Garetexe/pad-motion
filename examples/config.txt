@@ -1,17 +1,9 @@
-# Este es tu control de sensibilidad general.
-# Edita este valor y guarda el archivo mientras el programa está corriendo:
-# se aplica solo, cada 1 segundo, sin reiniciar nada.
-# Sube el numero para MAS sensibilidad, bajalo para MENOS.
-sensitivity=60.0
-
-# Que tan fluido/suavizado se ve el movimiento (0.0 = nada suave, 0.98 = maximo).
-# Mas alto = mas fluido pero con un poquito mas de retardo.
-smoothing=100.9
-
-# Direccion de los ejes. Usa 1.0 o -1.0 para invertir cada uno.
-invert_x=1.0
-invert_y=-1.0
-
-# Eje sobre el que se aplica la gravedad: 0=X, 1=Y (por defecto), 2=Z
+sensitivity=40.0
+invert_x=1
+invert_y=-1
 gravity_axis=1
 gravity_amount=9.81
+smoothing=0.9
+deadzone=2.0
+pitch_limit=300.0
+pitch_recenter=0.15
